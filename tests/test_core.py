@@ -1,0 +1,282 @@
+"""
+Tests que NO requieren mediapipe ni ultralytics instalados (solo prueban
+la lógica pura: esquema de keypoints, métricas, oclusión, iluminación).
+Los wrappers de modelos (mediapipe_pose.py, yolov8_pose.py) se prueban
+aparte, una vez esas librerías estén instaladas en el entorno de desarrollo.
+
+Ejecutar con: pytest tests/test_core.py -v
+"""
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from app.config import classify_angular_error
+from app.core.ground_truth import (
+    MaxtraqRecording,
+    compare_angle_series,
+    find_best_time_offset,
+    marker_angle_series_deg,
+    parse_maxtraq_txt,
+)
+from app.core.keypoint_schema import COCO_ORDER, MEDIAPIPE_INDEX, YOLO_COCO_INDEX, Keypoint
+from app.core.metrics import angular_error_report, mpjpe, pck
+from app.core.occlusion import apply_occlusion, occlusion_fraction_of_frame, region_from_fixed_fraction
+from app.core.results_store import create_run_dir, save_frame_metrics_csv, save_keypoints_json, save_summary_csv
+from app.core.video_io import open_video
+from app.schemas.pose_result import ModelName, VideoAnalysisResult
+
+
+def test_keypoint_schema_has_all_17_coco_points():
+    assert len(COCO_ORDER) == 17
+    assert len(MEDIAPIPE_INDEX) == 17
+    assert len(YOLO_COCO_INDEX) == 17
+    assert set(MEDIAPIPE_INDEX.keys()) == set(COCO_ORDER)
+
+
+def test_mediapipe_indices_are_within_valid_range():
+    # MediaPipe Pose tiene 33 landmarks válidos: índices 0 a 32
+    for name, idx in MEDIAPIPE_INDEX.items():
+        assert 0 <= idx <= 32, f"{name} tiene índice inválido: {idx}"
+
+
+def _make_keypoints(offset: float = 0.0) -> list[Keypoint]:
+    """Genera un set de keypoints sintético para pruebas, en línea recta."""
+    return [
+        Keypoint(name=name, x=10.0 * i + offset, y=10.0 * i + offset, confidence=0.9, visible=True)
+        for i, name in enumerate(COCO_ORDER)
+    ]
+
+
+def test_mpjpe_is_zero_for_identical_keypoints():
+    kpts = _make_keypoints()
+    assert mpjpe(kpts, kpts) == 0.0
+
+
+def test_mpjpe_increases_with_offset():
+    gt = _make_keypoints(offset=0.0)
+    pred = _make_keypoints(offset=5.0)
+    error = mpjpe(pred, gt)
+    assert error > 0.0
+
+
+def test_angular_error_classification_thresholds():
+    assert classify_angular_error(3.0) == "aceptable"
+    assert classify_angular_error(5.0) == "aceptable"
+    assert classify_angular_error(7.5) == "moderado"
+    assert classify_angular_error(15.0) == "no_aceptable"
+
+
+def test_angular_error_report_returns_all_joints():
+    kpts = _make_keypoints()
+    report = angular_error_report(kpts, kpts)
+    assert "left_knee" in report
+    assert "right_elbow" in report
+    # Mismos puntos -> mismo ángulo -> error 0 -> aceptable
+    for joint_report in report.values():
+        if joint_report["error_deg"] is not None:
+            assert joint_report["classification"] == "aceptable"
+
+
+def test_pck_perfect_match_is_one():
+    kpts = _make_keypoints()
+    score = pck(kpts, kpts)
+    assert score == 1.0
+
+
+def test_occlusion_region_fraction_is_reasonable():
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    region = region_from_fixed_fraction(frame.shape, x_fraction_range=(0.0, 1.0), y_fraction_range=(0.66, 1.0))
+    fraction = occlusion_fraction_of_frame(region, frame.shape)
+    assert 0.3 < fraction < 0.4  # ~ un tercio del frame
+
+
+def test_apply_occlusion_blackens_region():
+    frame = np.full((100, 100, 3), 255, dtype=np.uint8)  # frame blanco
+    region = region_from_fixed_fraction(frame.shape, (0.0, 0.5), (0.0, 0.5))
+    occluded = apply_occlusion(frame, region)
+    assert occluded[10, 10].sum() == 0  # dentro de la región: negro
+    assert occluded[90, 90].sum() == 255 * 3  # fuera de la región: intacto
+
+
+_SAMPLE_MAXTRAQ_TXT = """Frame number,3
+First frame,1
+Point frequency,60
+Analog frequency,60
+
+Time,Point #1,,,Point #2,,,Point #3,,,Point #4,,,Point #5,,,Point #6,,
+s,cm,cm,cm,cm,cm,cm,cm,cm,cm,cm,cm,cm,cm,cm,cm,cm,cm,cm
+,X,Y,Z,X,Y,Z,X,Y,Z,X,Y,Z,X,Y,Z,X,Y,Z
+0,0,0,0,0,0,0,0,10,0,0,0,0,0,20,0,0,0,0
+0.0166667,0,0,0,0,0,0,0,10,0,0,0,0,0,20,0,0,0,0
+0.0333333,,,,0,0,0,0,10,0,0,0,0,0,20,0,0,0,0
+"""
+
+
+def test_parse_maxtraq_txt_reads_header_and_points(tmp_path: Path):
+    path = tmp_path / "sample_maxtraq.TXT"
+    path.write_text(_SAMPLE_MAXTRAQ_TXT, encoding="utf-8")
+
+    recording = parse_maxtraq_txt(path)
+
+    assert recording.point_frequency_hz == 60.0
+    assert recording.total_frames == 3
+    assert len(recording.times_s) == 3
+    assert set(recording.points.keys()) == {1, 2, 3, 4, 5, 6}
+    assert recording.points[3][0] == (0.0, 10.0, 0.0)
+
+
+def test_parse_maxtraq_txt_marks_missing_marker_as_none(tmp_path: Path):
+    path = tmp_path / "sample_maxtraq.TXT"
+    path.write_text(_SAMPLE_MAXTRAQ_TXT, encoding="utf-8")
+
+    recording = parse_maxtraq_txt(path)
+
+    assert recording.points[1][2] is None  # tercer frame, marcador #1 vacío
+
+
+def test_marker_angle_series_deg_computes_straight_leg_as_180():
+    # Marcadores 1 (cadera), 3 (rodilla), 5 (tobillo) alineados -> pierna
+    # recta -> 180°.
+    recording = MaxtraqRecording(
+        point_frequency_hz=60.0,
+        total_frames=1,
+        times_s=[0.0],
+        points={1: [(0.0, 0.0, 0.0)], 3: [(0.0, 10.0, 0.0)], 5: [(0.0, 20.0, 0.0)]},
+    )
+
+    angles = marker_angle_series_deg(recording, (1, 3, 5))
+    assert angles[0] == pytest.approx(180.0)
+
+
+def test_compare_angle_series_zero_error_for_identical_series():
+    result = compare_angle_series([170.0, 165.0, 180.0], [170.0, 165.0, 180.0])
+    assert result["mean_error_deg"] == 0.0
+    assert result["rmse_deg"] == 0.0
+    assert result["classification"] == "aceptable"
+
+
+def test_compare_angle_series_rmse_penalizes_outliers_more_than_mae():
+    # Mismo error promedio absoluto, pero un solo pico grande en vez de error
+    # uniforme -- RMSE debe quedar por encima de MAE, mostrando que castiga
+    # más la varianza del error frame a frame.
+    pred = [100.0, 100.0, 100.0, 106.0]
+    gt = [100.0, 100.0, 100.0, 100.0]
+    result = compare_angle_series(pred, gt)
+    assert result["mean_error_deg"] == pytest.approx(1.5)
+    assert result["rmse_deg"] > result["mean_error_deg"]
+
+
+def test_find_best_time_offset_recovers_known_shift():
+    import math
+
+    # Señal periódica sintética (simula un ciclo de marcha) en el "reloj" del gt.
+    gt_times = [i * 0.1 for i in range(200)]  # 0 a 19.9s
+    gt_angles = [150 + 30 * math.sin(t) for t in gt_times]
+
+    # La misma señal, pero el reloj del "query" arrancó 2.5s despues del gt.
+    known_offset = 2.5
+    query_times = [t + known_offset for t in gt_times]
+    query_angles = gt_angles
+
+    result = find_best_time_offset(gt_times, gt_angles, query_times, query_angles, search_range_s=(-5.0, 5.0))
+
+    assert result["offset_s"] == pytest.approx(known_offset, abs=0.05)
+    assert result["correlation"] > 0.99
+
+
+def test_create_run_dir_builds_model_condition_timestamp_hierarchy(tmp_path: Path):
+    run_dir = create_run_dir(tmp_path, model_label="yolo26n", condition="no_occlusion")
+
+    assert run_dir.is_dir()
+    assert run_dir.parent.name == "no_occlusion"
+    assert run_dir.parent.parent.name == "yolo26n"
+    assert run_dir.parent.parent.parent == tmp_path
+    assert (run_dir / "metrics").is_dir()
+    assert (run_dir / "graphs" / "curves").is_dir()
+    assert (run_dir / "graphs" / "bars").is_dir()
+    assert not (run_dir / "videos").exists()  # se crea bajo demanda, no siempre
+
+
+def test_create_run_dir_separates_models_and_conditions(tmp_path: Path):
+    no_occlusion_dir = create_run_dir(tmp_path, model_label="yolo26n", condition="no_occlusion")
+    occlusion_dir = create_run_dir(tmp_path, model_label="yolo26n", condition="occlusion")
+    other_model_dir = create_run_dir(tmp_path, model_label="mediapipe_heavy", condition="no_occlusion")
+
+    assert no_occlusion_dir != occlusion_dir != other_model_dir
+    assert no_occlusion_dir.parent.parent == occlusion_dir.parent.parent == tmp_path / "yolo26n"
+    assert other_model_dir.parent.parent == tmp_path / "mediapipe_heavy"
+
+
+def test_save_keypoints_json_writes_readable_pose_result(tmp_path: Path):
+    result = VideoAnalysisResult(
+        video_id="test_video",
+        model_name=ModelName.YOLOV8,
+        fps=30.0,
+        total_frames=0,
+        frames=[],
+        mean_latency_ms=0.0,
+    )
+    run_dir = create_run_dir(tmp_path, model_label="yolo26n", condition="no_occlusion")
+
+    out_path = save_keypoints_json(run_dir / "metrics", "yolo26n", result)
+
+    assert out_path.exists()
+    assert '"video_id":"test_video"' in out_path.read_text(encoding="utf-8").replace(" ", "").replace("\n", "")
+
+
+def test_save_frame_metrics_csv_includes_error_per_model(tmp_path: Path):
+    run_dir = create_run_dir(tmp_path, model_label="yolo26n", condition="no_occlusion")
+    gt_times = [0.0, 1.0]
+    gt_angles = [180.0, 170.0]
+    model_curves = {"yolo26n": [175.0, 168.0], "mediapipe_heavy": [178.0, 172.0]}
+
+    out_path = save_frame_metrics_csv(run_dir / "metrics", gt_times, gt_angles, model_curves, leg="left_knee")
+
+    lines = out_path.read_text(encoding="utf-8").strip().splitlines()
+    assert lines[0] == "frame_idx,time_s,gt_left_knee_angle_deg,yolo26n_angle_deg,yolo26n_error_deg,mediapipe_heavy_angle_deg,mediapipe_heavy_error_deg"
+    assert lines[1] == "0,0.0,180.0,175.0,5.0,178.0,2.0"
+
+
+def test_save_summary_csv_writes_one_row_per_variant(tmp_path: Path):
+    run_dir = create_run_dir(tmp_path, model_label="yolo26n", condition="no_occlusion")
+    reports = {
+        "yolo26n": {
+            "mean_error_deg": 8.45,
+            "rmse_deg": 10.12,
+            "max_error_deg": 20.1,
+            "n_frames": 333,
+            "classification": "moderado",
+            "elapsed_s": 19.5,
+        },
+    }
+
+    out_path = save_summary_csv(run_dir / "metrics", reports)
+
+    lines = out_path.read_text(encoding="utf-8").strip().splitlines()
+    assert lines[0] == "variante,error_medio_deg,rmse_deg,error_max_deg,n_frames,clasificacion,tiempo_s"
+    assert lines[1] == "yolo26n,8.45,10.12,20.1,333,moderado,19.5"
+
+
+def test_open_video_applies_metadata_orientation(tmp_path: Path):
+    import cv2
+
+    path = tmp_path / "tiny.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 10, (64, 48))
+    for _ in range(3):
+        writer.write(np.zeros((48, 64, 3), dtype=np.uint8))
+    writer.release()
+
+    cap = open_video(str(path))
+    try:
+        assert cap.get(cv2.CAP_PROP_ORIENTATION_AUTO) == 1
+        ret, frame = cap.read()
+        assert ret and frame.shape == (48, 64, 3)
+    finally:
+        cap.release()
+
+
+def test_open_video_raises_for_missing_file(tmp_path: Path):
+    with pytest.raises(FileNotFoundError):
+        open_video(str(tmp_path / "no_existe.mp4"))

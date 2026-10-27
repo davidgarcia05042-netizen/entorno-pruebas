@@ -1,0 +1,16 @@
+pydantic==2.9.2
+
+# Modelos de visión por computador
+mediapipe==0.10.14
+ultralytics==8.4.128
+opencv-python-headless==4.10.0.84
+numpy==1.26.4
+
+# Gráficas (curvas, barras, heatmaps de resultados)
+matplotlib==3.11.1
+
+# Diagnóstico informal de recursos (scripts/_diag_resource_check.py)
+psutil==7.2.2
+
+# Testing
+pytest==8.3.3
